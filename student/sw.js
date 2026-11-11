@@ -24,6 +24,10 @@ self.addEventListener('push', (e) => {
   e.waitUntil((async () => {
     const n = (await getCount()) + 1;
     await setCount(n);
+    // 「新しい内容あり」の印（アプリを開いたとき、ためてある内容を使わず読み込み直す）
+    await (await caches.open('seishin-meta')).put('dirty', new Response('1'));
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    wins.forEach((c) => c.postMessage({ type: 'pushed' }));
     try { if ('setAppBadge' in self.navigator) await self.navigator.setAppBadge(n); } catch (err) {}
     await self.registration.showNotification(title, {
       body: d.body || '',
