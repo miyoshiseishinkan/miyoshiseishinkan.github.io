@@ -64,6 +64,7 @@
     //   ・アプリ本体（Google Apps Script）をこのページの中に表示する
     //   ・ログイン情報をこのページに保存して、次に開いたときもログインしたままにする
     //   ・起動画面、通知の受け取り、アプリアイコンの数字
+    //   ・画面の内容と音声の保存（アプリを閉じても消えないように。2026-11-25）
     // ==================================================
     const CONF = {
       app: 'parent',
@@ -121,6 +122,101 @@
     $('app').addEventListener('load', () => { setTimeout(() => { if (!inner) hideSplash(); }, 5000); });
     $('app').src = CONF.gas;
 
+    // ---- 画面の内容と音声の保存（2026-11-25） ----
+    //   アプリ本体（Googleのページ）の中の保存は、アプリを閉じると消えることがあるため、このページ（IndexedDB）に保存する。
+    //   文字（画面の内容）は、起動のときにまとめてアプリ本体に渡す。音声などは、頼まれたときに渡す。
+    //   古いものから消す：文字は30日、音声は14日。音声の合計が40MBを超えたら、古い順に消す。
+    const CACHE_DB = 'seishin-cache-' + CONF.app;
+    const CACHE_BIN_MAX = 40 * 1024 * 1024;
+    let cacheDbP = null;
+    function cacheDb() {
+      if (cacheDbP) return cacheDbP;
+      cacheDbP = new Promise((resolve, reject) => {
+        if (!window.indexedDB) { reject(new Error('no indexedDB')); return; }
+        const r = indexedDB.open(CACHE_DB, 1);
+        r.onupgradeneeded = () => {
+          const db = r.result;
+          ['json', 'bin', 'meta'].forEach((n) => { if (!db.objectStoreNames.contains(n)) db.createObjectStore(n, { keyPath: 'k' }); });
+        };
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      cacheDbP.catch(() => { cacheDbP = null; });
+      return cacheDbP;
+    }
+    // 文字の保存をまとめて読む（30日より古いものは消す）
+    function cacheAllJson() {
+      return cacheDb().then((db) => new Promise((resolve) => {
+        const out = {};
+        const now = Date.now();
+        const tx = db.transaction('json', 'readwrite');
+        const req = tx.objectStore('json').openCursor();
+        req.onsuccess = () => {
+          const c = req.result;
+          if (!c) return;
+          if (now - (c.value.t || 0) > 30 * 86400000) c.delete(); else out[c.value.k] = c.value.v;
+          c.continue();
+        };
+        tx.oncomplete = () => resolve(out);
+        tx.onerror = () => resolve(out);
+        tx.onabort = () => resolve(out);
+      })).catch(() => ({}));
+    }
+    function cachePut(key, value, bin) {
+      cacheDb().then((db) => {
+        const now = Date.now();
+        if (bin) {
+          const tx = db.transaction(['bin', 'meta'], 'readwrite');
+          tx.objectStore('bin').put({ k: key, v: value });
+          tx.objectStore('meta').put({ k: key, t: now, s: value.byteLength || 0 });
+          tx.oncomplete = cachePrune;
+        } else {
+          db.transaction('json', 'readwrite').objectStore('json').put({ k: key, v: value, t: now });
+        }
+      }).catch(() => {});
+    }
+    function cacheGetBin(key) {
+      return cacheDb().then((db) => new Promise((resolve) => {
+        const req = db.transaction('bin', 'readonly').objectStore('bin').get(key);
+        req.onsuccess = () => resolve(req.result ? req.result.v : null);
+        req.onerror = () => resolve(null);
+      })).catch(() => null);
+    }
+    function cacheClearPrefix(prefix) {
+      cacheDb().then((db) => {
+        const req = db.transaction('json', 'readwrite').objectStore('json').openCursor();
+        req.onsuccess = () => {
+          const c = req.result;
+          if (!c) return;
+          if (String(c.key).indexOf(prefix) === 0) c.delete();
+          c.continue();
+        };
+      }).catch(() => {});
+    }
+    // 音声：14日より古いものと、合計が上限を超えた分を、古い順に消す
+    function cachePrune() {
+      cacheDb().then((db) => {
+        const tx = db.transaction(['bin', 'meta'], 'readwrite');
+        const req = tx.objectStore('meta').getAll();
+        req.onsuccess = () => {
+          const list = (req.result || []).sort((a, b) => a.t - b.t);
+          let total = list.reduce((n, m) => n + (m.s || 0), 0);
+          const now = Date.now();
+          list.forEach((m) => {
+            if (now - m.t > 14 * 86400000 || total > CACHE_BIN_MAX) {
+              tx.objectStore('bin').delete(m.k);
+              tx.objectStore('meta').delete(m.k);
+              total -= m.s || 0;
+            }
+          });
+        };
+      }).catch(() => {});
+    }
+    // 起動のときに読む文字の保存（1.5秒たっても読めなければ、保存なしで起動する）
+    function cacheForHello() {
+      return Promise.race([cacheAllJson(), new Promise((r) => setTimeout(() => r({}), 1500))]);
+    }
+
     // ---- アプリ本体とのやりとり ----
     window.addEventListener('message', (e) => {
       if (!ALLOWED.test(e.origin) || !e.data || e.data.ns !== 'seishin') return;
@@ -128,13 +224,21 @@
       innerOrigin = e.origin;
       const d = e.data;
       if (d.type === 'hello') {
-        takeDirty().then((fresh) => {
-          toInner({ type: 'store', data: store, open: pendingOpen, insets: insets(), push: pushState(), fresh: fresh });
+        Promise.all([takeDirty(), cacheForHello()]).then(([fresh, cache]) => {
+          toInner({ type: 'store', data: store, cache: cache, open: pendingOpen, insets: insets(), push: pushState(), fresh: fresh });
           pendingOpen = '';
         });
         if (pushState() === 'granted') refreshToken();
       } else if (d.type === 'set') {
         if (typeof d.key === 'string' && typeof d.value === 'string' && d.value.length < 200000) { store[d.key] = d.value; saveStore(); }
+      } else if (d.type === 'cache-put') {
+        if (typeof d.key !== 'string' || d.key.length > 300) return;
+        if (d.bin && d.value instanceof ArrayBuffer && d.value.byteLength < 10 * 1024 * 1024) cachePut(d.key, d.value, true);
+        else if (!d.bin && typeof d.value === 'string' && d.value.length < 2000000) cachePut(d.key, d.value, false);
+      } else if (d.type === 'cache-get') {
+        if (typeof d.key === 'string') cacheGetBin(d.key).then((v) => toInner({ type: 'cache-val', id: d.id, key: d.key, value: v }));
+      } else if (d.type === 'cache-clear') {
+        if (typeof d.prefix === 'string' && d.prefix.length >= 4) cacheClearPrefix(d.prefix);
       } else if (d.type === 'remove') {
         if (typeof d.key === 'string') { delete store[d.key]; saveStore(); }
       } else if (d.type === 'ready') {
